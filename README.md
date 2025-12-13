@@ -69,6 +69,30 @@
 
 ---
 
+### 🎮 mc_server.py - Minecraft Server Monitor
+- Real-time monitoring of Minecraft server status
+- Automatic updates every 5 minutes with live player count and server info
+- Shared server data across multiple guilds to prevent duplicate queries
+- Domain-to-IP resolution for server address validation
+- Dedicated read-only channels with embedded status panels
+- Abuse prevention with rate limiting and guild-based registration caps
+
+#### Slash Commands
+| Command       | Description                                      |
+|--------------|--------------------------------------------------|
+| `/mcs_add`   | Creates a monitoring channel with server details |
+| `/mcs_remove`| Removes a server monitoring channel              |
+| `/mcs_list`  | Shows all registered servers in the guild        |
+| `/mcs_update`| Manually updates server status panels            |
+
+#### Features
+- **Efficient Querying**: Servers are queried only once every 30 seconds, even if monitored by multiple guilds
+- **Auto-cleanup**: Automatically removes database entries when channels are deleted
+- **Security**: Rate limiting (3 registrations per minute) and registration caps (10 servers per guild)
+- **Smart Caching**: Stores both domain names and resolved IPs for reliability
+
+---
+
 ## 🛠 설치 방법
 
 ### 방법 1: 로컬 환경
