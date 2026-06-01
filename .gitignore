@@ -11,3 +11,4 @@ self_bot.py
 cogs/jungan.py
 cogs/z_*.py
 .cache
+.claude/
