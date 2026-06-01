@@ -395,7 +395,6 @@ class Music(commands.Cog):
         name="스포티파이", 
         description="사용자의 스포티파이 활동을 기준으로 노래를 재생합니다."
     )
-    @app_commands.default_permissions(administrator=True)
     async def spotify_play(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
