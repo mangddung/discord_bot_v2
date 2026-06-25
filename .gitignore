@@ -14,3 +14,5 @@ cogs/z_*.py
 .claude/
 memory-bank/
 docs/
+
+music-bot-app-main/

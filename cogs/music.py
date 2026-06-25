@@ -1,11 +1,9 @@
 import asyncio
 import discord
+import wavelink
 from discord import app_commands
 from discord.ext import commands
-import yt_dlp
-from youtubesearchpython import VideosSearch, Video, Playlist
 from utils import *
-import copy
 
 from sqlalchemy import Column, Integer, String, Boolean, desc
 from sqlalchemy.ext.declarative import declarative_base
@@ -40,47 +38,58 @@ class Queues(Base):
     isrc = Column(String, nullable=True)
     uuid = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
 
-# 음악 재생 설정
+# 음악 재생 설정 (Lavalink / wavelink)
 #========================================================================================
-ffmpeg_path = os.getenv('FFMPEG_PATH')  # FFmpeg 경로
-ffmpeg_source = []
-ffmpeg_options = {
-        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-        'options': '-vn -bufsize 2M -threads 6'
-    }
-# yt-dlp로 유튜브 오디오 스트림을 가져옵니다.
-ydl_opts = {
-    'format': 'bestaudio/best',
-    'noplaylist': True,
-    'quiet': True,
-    'extractaudio': True,
-    'ratelimit': 5000000,
-}
+# 자동 disconnect 타임아웃 (초)
+AUTO_DISCONNECT_TIMEOUT = int(os.getenv('AUTO_DISCONNECT_TIMEOUT', '600'))
+# 재생 시도 중복 방지 락
 guild_locks = {}
+# 자동 disconnect 타이머 (guild_id -> asyncio.Task)
+disconnect_tasks = {}
 
-# 음악 재생 관련 함수
+# 자동 disconnect 타이머 관리
 #========================================================================================
-async def play_next_music(self, voice_client, guild_id):
+async def _auto_disconnect(guild_id, player: wavelink.Player):
+    await asyncio.sleep(AUTO_DISCONNECT_TIMEOUT)
+    if player.connected and not player.playing:
+        await player.disconnect()
+        disconnect_tasks.pop(guild_id, None)
+        logger.info(f"Music || 대기열 없음 자동 연결 해제 | Guild: {guild_id}")
+
+def start_disconnect_timer(guild_id, player: wavelink.Player):
+    cancel_disconnect_timer(guild_id)
+    task = asyncio.create_task(_auto_disconnect(guild_id, player))
+    disconnect_tasks[guild_id] = task
+
+def cancel_disconnect_timer(guild_id):
+    task = disconnect_tasks.pop(guild_id, None)
+    if task and not task.done():
+        task.cancel()
+
+# 음악 재생 관련 함수 (wavelink)
+#========================================================================================
+async def play_next_music(self, player: wavelink.Player, guild_id):
     try:
         with get_db() as db:
             first_queue_db = db.query(Queues).filter(Queues.guild_id==guild_id).order_by(Queues.id).first()
             if not first_queue_db:
+                start_disconnect_timer(str(guild_id), player)
                 return
-            
+
             # 멤버 정보 가져오기
             guild = self.bot.get_guild(int(guild_id))
             member = guild.get_member(int(first_queue_db.member_id))
 
             if member is None:
                 return
-            
+
             # 스포티파이 연동 재생 확인
             spotify_playback = None
             if first_queue_db.is_spotify:
                 # 재생 완료 곡 삭제
                 db.delete(first_queue_db)
                 db.commit()
-                
+
                 # 스포티파이 활동 찾기
                 spotify_activity = next(
                     (a for a in member.activities if isinstance(a, discord.Spotify)),
@@ -88,18 +97,18 @@ async def play_next_music(self, voice_client, guild_id):
                 )
                 if not spotify_activity:
                     return
-                
+
                 # track_id로 현재곡 정보 조회
                 spotify_playback = get_track_info(spotify_activity)
                 if not spotify_playback:
-                    return  
-                
+                    return
+
                 # playback 정보로 유튜브 노래 검색
                 search_result = playback_youtube_search(spotify_playback)
                 if not search_result:
                     return
-                
-                # 새로운 곡 DB에 추가 ( 길드 설정에 따라 다르게 설정, 스포티파이 우선, 대기열 우선) 지금 코드는 대기열 우선
+
+                # 새로운 곡 DB에 추가 (대기열 우선)
                 next_queue = db.query(Queues).filter(Queues.guild_id==guild_id).order_by(Queues.id).first()
                 if not next_queue:
                     try:
@@ -124,7 +133,7 @@ async def play_next_music(self, voice_client, guild_id):
                     except Exception as ex:
                         db.rollback()
                         raise ValueError("스포티파이 대기열에 음악을 추가하는 중 오류가 발생했습니다.") from ex
-                
+
                     next_music = new_queue
                 else:
                     next_music = next_queue
@@ -144,17 +153,12 @@ async def play_next_music(self, voice_client, guild_id):
                 if member_voice:
                     member_voice_channel = member_voice.channel
                 else:
-                    await play_next_music(self, voice_client, guild_id)
+                    await play_next_music(self, player, guild_id)
                     return
-                
+
                 # 보이스 채널 다르면 같은 채널로 이동
-                bot_voice_channel = guild.voice_client
-                if bot_voice_channel and bot_voice_channel.is_connected():
-                    if bot_voice_channel.channel != member_voice_channel:
-                        await bot_voice_channel.disconnect()
-                        voice_client = await member_voice_channel.connect()
-                    else:
-                        voice_client = bot_voice_channel
+                if player.connected and player.channel != member_voice_channel:
+                    await player.move_to(member_voice_channel)
 
                 start_seconds = 0
 
@@ -174,8 +178,8 @@ async def play_next_music(self, voice_client, guild_id):
                         db.delete(next_music)
                         db.commit()
                         return
-                    
-                # 스포티파이 재생인 경우 ffmpeg 옵션 변경
+
+                # 스포티파이 재생인 경우 시작 위치 계산
                 if next_music.is_spotify:
                     start_poition_result = get_spotify_start_position(spotify_playback)
                     if start_poition_result["should_skip"]:
@@ -185,63 +189,53 @@ async def play_next_music(self, voice_client, guild_id):
 
                     start_seconds = start_poition_result["start_seconds"]
 
-                    # -ss 옵션 추가
-                    custom_ffmpeg_options = copy.deepcopy(ffmpeg_options)
-                    custom_ffmpeg_options['before_options'] = f"-ss {start_seconds} " + custom_ffmpeg_options['before_options']
-                else:
-                    custom_ffmpeg_options = ffmpeg_options
+                # wavelink 로 트랙 검색 및 재생
+                tracks = await wavelink.Playable.search(f"https://www.youtube.com/watch?v={next_music.video_id}")
+                if not tracks:
+                    logger.warning(f"Music || Lavalink에서 트랙을 찾을 수 없음 | Guild: {guild_id}, Video: {next_music.video_id}")
+                    await play_next_music(self, player, guild_id)
+                    return
 
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(next_music.video_id, download=False)
-                    url2 = info['url']
-                voice_client.play(
-                    discord.FFmpegPCMAudio(executable=ffmpeg_path, source=url2, **custom_ffmpeg_options),
-                    after=lambda e: asyncio.run_coroutine_threadsafe(play_next_music(self, voice_client, guild_id),voice_client.loop)
-                )
+                await player.play(tracks[0], start=start_seconds * 1000)
+                cancel_disconnect_timer(str(guild_id))
 
             # 임베드 업데이트
             await update_panel_message(guild)
 
     except Exception as ex:
-        print(f"Error(play_next_music): {ex}")
+        logger.error(f"Error(play_next_music): {ex}")
         with get_db() as db:
             db.rollback()
 
-async def play_music(self, voice_client, guild_id, yt_id, interaction=None, spotify_playback=None):
-    # 재생 프로세스(다운로드, 재생) 중복 요청 방지
+async def play_music(self, player: wavelink.Player, guild_id, yt_id, interaction=None, spotify_playback=None):
+    # 재생 프로세스 중복 요청 방지
     if guild_id not in guild_locks:
         guild_locks[guild_id] = asyncio.Lock()
     lock = guild_locks[guild_id]
     async with lock:
-        if not voice_client.is_playing():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = await asyncio.to_thread(ydl.extract_info, yt_id, False)
-                url2 = info['url']
-
-            def after_playing(e):
-                asyncio.run_coroutine_threadsafe(play_next_music(self, voice_client, guild_id), self.bot.loop)
-
+        if not player.playing:
             # 스포티파이 연동 재생인 경우
             if spotify_playback:
                 result = get_spotify_start_position(spotify_playback)
-
                 if result["should_skip"]:
                     if interaction:
                         await interaction.followup.send("해당 곡은 곧 끝나기 때문에 재생이 생략되었습니다. 잠시 후 다시 시도해주세요.")
-
+                    return
                 start_seconds = result["start_seconds"]
-
-                # 기존 옵션을 복사해서 새로운 dict 생성
-                custom_ffmpeg_options = copy.deepcopy(ffmpeg_options)
-                custom_ffmpeg_options['before_options'] = f"-ss {start_seconds} " + custom_ffmpeg_options['before_options']
-            
             else:
                 start_seconds = 0
-                custom_ffmpeg_options = copy.deepcopy(ffmpeg_options)
-            voice_client.play(
-                discord.FFmpegPCMAudio(executable=ffmpeg_path, source=url2, **custom_ffmpeg_options),
-                after=after_playing
-            )
+
+            # wavelink 로 트랙 검색
+            tracks = await wavelink.Playable.search(f"https://www.youtube.com/watch?v={yt_id}")
+            if not tracks:
+                logger.error(f"Music || Lavalink에서 트랙을 찾을 수 없음 | Guild: {guild_id}, Video: {yt_id}")
+                return
+
+            try:
+                await player.play(tracks[0], start=start_seconds * 1000)
+                cancel_disconnect_timer(str(guild_id))
+            except Exception as ex:
+                logger.error(f"Music || 재생 오류 | Guild: {guild_id}, Video: {yt_id}, Err: {ex}")
 
 # 스포티파이 주기적 동기화
 async def sync_spotify(self):
@@ -256,28 +250,30 @@ async def sync_spotify(self):
                     if not current_queue.is_spotify:
                         continue
 
-                    # 보이스 클라이언트 가져오기
-                    voice_client = guild.voice_client
+                    # wavelink player 가져오기
+                    player = guild.voice_client
+                    if not player or not player.connected:
+                        continue
 
                     # 멤버 가져오기
                     member = guild.get_member(current_queue.member_id)
                     if not member:
-                        return
-                    
+                        continue
+
                     # 스포티파이 활동 가져오기
                     spotify_activity = next(
                         (a for a in member.activities if isinstance(a, discord.Spotify)),
                         None
                     )
                     if not spotify_activity:
-                        voice_client.stop()
+                        await player.skip(force=True)
                         await update_panel_message(guild)
-                        return
-                    
+                        continue
+
                     # track_id로 현재곡 정보 조회
                     spotify_playback = get_track_info(spotify_activity)
                     if not spotify_playback:
-                        return  
+                        continue
 
                     # isrc 값으로 확인
                     if current_queue.isrc:
@@ -288,13 +284,13 @@ async def sync_spotify(self):
                         # playback으로 검색
                         current_playback = playback_youtube_search(spotify_playback)
                         if not current_playback:
-                            return
+                            continue
                         # 검색 결과 id 가 현재 곡과 같은 경우
                         if current_playback['id'] == current_queue.video_id:
                             continue
 
                     # 다르면 현재 곡으로 재생(스킵 기능으로)
-                    voice_client.stop()
+                    await player.skip(force=True)
                 except Exception as e:
                     print(f'sync_spotify error: {e}')
                 finally:
@@ -442,17 +438,18 @@ class Music(commands.Cog):
                     await interaction.followup.send(f"스포티파이 연동 재생: {search_result['title']}을(를) 재생합니다.")
                 
                 member_voice_channel = member.voice.channel
+                from utils.music_player import ChannelIdPlayer
                 bot_voice_client = interaction.guild.voice_client
 
-                if bot_voice_client and bot_voice_client.is_connected():
+                if bot_voice_client and bot_voice_client.connected:
                     # 봇과 다른 채널이면 요청자 채널로 이동(대기열 비었을때)
                     if bot_voice_client.channel != member_voice_channel and not last_queue:
                         await bot_voice_client.disconnect()
-                        voice_client = await member_voice_channel.connect()
+                        player = await member_voice_channel.connect(cls=ChannelIdPlayer)
                     else:
-                        voice_client = bot_voice_client
+                        player = bot_voice_client
                 else:
-                    voice_client = await member_voice_channel.connect()
+                    player = await member_voice_channel.connect(cls=ChannelIdPlayer)
 
                 # 대기열 DB에 추가
                 new_queue = Queues(
@@ -473,7 +470,7 @@ class Music(commands.Cog):
                 await update_panel_message(interaction.guild)
 
                 # 노래 재생
-                asyncio.create_task(play_music(self, voice_client, interaction.guild_id, search_result['id'], interaction, spotify_playback))
+                asyncio.create_task(play_music(self, player, interaction.guild_id, search_result['id'], interaction, spotify_playback))
                 logger.info(f"Music || 🎵 {search_result['title']} 재생 시작 | Guild: {interaction.guild_id}, Music Id: {search_result['id']}, Duration: {search_result['duration']}, Requester : {member.id}")
         except Exception as ex:
             with get_db() as db:
@@ -573,17 +570,18 @@ class Music(commands.Cog):
                 asyncio.create_task(delete_message_later(msg, 3))
                 
                 member_voice_channel = member.voice.channel
+                from utils.music_player import ChannelIdPlayer
                 bot_voice_client = message.guild.voice_client
 
-                if bot_voice_client and bot_voice_client.is_connected():
+                if bot_voice_client and bot_voice_client.connected:
                     # 봇과 다른 채널이면 요청자 채널로 이동(대기열 비었을때)
                     if bot_voice_client.channel != member_voice_channel and not last_queue:
                         await bot_voice_client.disconnect()
-                        voice_client = await member_voice_channel.connect()
+                        player = await member_voice_channel.connect(cls=ChannelIdPlayer)
                     else:
-                        voice_client = bot_voice_client
+                        player = bot_voice_client
                 else:
-                    voice_client = await member_voice_channel.connect()
+                    player = await member_voice_channel.connect(cls=ChannelIdPlayer)
 
                 # 대기열 DB에 추가
                 new_queue = Queues(
@@ -602,7 +600,7 @@ class Music(commands.Cog):
             await update_panel_message(message.guild)
 
             # 노래 재생
-            asyncio.create_task(play_music(self, voice_client, guild_id, search_result['id']))
+            asyncio.create_task(play_music(self, player, guild_id, search_result['id']))
             logger.info(f"Music || 🎵 {search_result['title']} 재생 시작 | Guild: {guild_id}, Music Id: {search_result['id']}, Duration: {search_result['duration']}, Requester : {member.id}")
 
         except Exception as ex:
@@ -626,6 +624,26 @@ class Music(commands.Cog):
                 if member_count == 0:
                     await self.bot.voice_clients[0].disconnect()
                     logger.info(f"Music || 음성 채널에 아무도 없어서 연결 해제 | Guild: {member.guild.id}, Channel: {voice_channel.id}")
+
+    # wavelink 트랙 종료 이벤트 (자동 다음 곡 재생)
+    @commands.Cog.listener()
+    async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
+        player = payload.player
+        if player is None:
+            return
+        guild_id = str(player.guild.id)
+        reason_str = str(payload.reason).lower()
+        reason_name = payload.reason.name.lower() if hasattr(payload.reason, "name") else reason_str
+        reason_value = str(payload.reason.value).lower() if hasattr(payload.reason, "value") else reason_str
+
+        is_valid_reason = False
+        for r in (reason_name, reason_value, reason_str):
+            if r in ("finished", "stopped", "load_failed", "loadfailed"):
+                is_valid_reason = True
+                break
+
+        if is_valid_reason:
+            await play_next_music(self, player, guild_id)
 
 #===============================================================================
 panel_message_list = {
@@ -659,34 +677,34 @@ async def create_panel_form(guild,play_queue = []):
 
     # 재생 버튼
     async def play_btn_callback(interaction):
-        voice_client = guild.voice_client
-        if not voice_client:
+        player = guild.voice_client
+        if not player:
             await interaction.response.send_message("음성 채널에 접속해 주세요.", ephemeral=True)
             return
         await interaction.response.edit_message(content="곡을 재생합니다.", view=view)
-        voice_client.resume()
+        await player.pause(False)
         logger.info(f"Music || 재생 버튼 입력 | Guild: {guild.id}, User: {interaction.user.id}")
 
     # 중지 버튼
     async def pause_btn_callback(interaction):
-        voice_client = guild.voice_client
-        if voice_client:
+        player = guild.voice_client
+        if player:
             await interaction.response.edit_message(content="곡이 중지되었습니다.", view=view)
-            voice_client.pause()
+            await player.pause(True)
             logger.info(f"Music || 중지 버튼 입력 | Guild: {guild.id}, User: {interaction.user.id}")
 
     # 스킵 버튼
     async def skip_btn_callback(interaction):
-        voice_client = guild.voice_client
-        if voice_client:
+        player = guild.voice_client
+        if player:
             await interaction.response.edit_message(content="곡이 스킵되었습니다.", view=view)
-            voice_client.stop()
+            await player.skip(force=True)
             logger.info(f"Music || 스킵 버튼 입력 | Guild: {guild.id}, User: {interaction.user.id}")
 
     #대기열 목록
     async def queue_dropdown_callback(interaction: discord.Interaction):
-        voice_client = guild.voice_client
-        if len(play_queue) > 1 and voice_client:
+        player = guild.voice_client
+        if len(play_queue) > 1 and player:
             # selected_option = int(queue_dropdown.values[0])
             # selected_music = play_queue.pop(selected_option)
             # play_queue.insert(1,selected_music)
