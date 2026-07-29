@@ -46,6 +46,18 @@ AUTO_DISCONNECT_TIMEOUT = int(os.getenv('AUTO_DISCONNECT_TIMEOUT', '600'))
 guild_locks = {}
 # 자동 disconnect 타이머 (guild_id -> asyncio.Task)
 disconnect_tasks = {}
+# 스포티파이 활동 캐시 member_id -> discord.Spotify (스포티파이 활동은 계정 단위라 서버 구분 불필요)
+spotify_activity_cache = {}
+
+def get_spotify_activity(member):
+    # 캐시 우선, 없으면 member.activities 폴백 (봇 시작 직후 presence 이벤트 수신 전 대비)
+    cached = spotify_activity_cache.get(member.id)
+    if cached:
+        return cached
+    return next(
+        (a for a in member.activities if isinstance(a, discord.Spotify)),
+        None
+    )
 
 # 자동 disconnect 타이머 관리
 #========================================================================================
@@ -91,10 +103,7 @@ async def play_next_music(self, player: wavelink.Player, guild_id):
                 db.commit()
 
                 # 스포티파이 활동 찾기
-                spotify_activity = next(
-                    (a for a in member.activities if isinstance(a, discord.Spotify)),
-                    None
-                )
+                spotify_activity = get_spotify_activity(member)
                 if not spotify_activity:
                     return
 
@@ -164,10 +173,7 @@ async def play_next_music(self, player: wavelink.Player, guild_id):
 
                 if next_music.is_spotify and spotify_playback is None:
                     # 다음 곡 스포티파이 활동 가져오기
-                    spotify_activity = next(
-                        (a for a in member.activities if isinstance(a, discord.Spotify)),
-                        None
-                    )
+                    spotify_activity = get_spotify_activity(member)
                     if not spotify_activity:
                         # 다음곡 요청한 유저가 스포티파이 재생중이 아니면 생략
                         db.delete(next_music)
@@ -261,10 +267,7 @@ async def sync_spotify(self):
                         continue
 
                     # 스포티파이 활동 가져오기
-                    spotify_activity = next(
-                        (a for a in member.activities if isinstance(a, discord.Spotify)),
-                        None
-                    )
+                    spotify_activity = get_spotify_activity(member)
                     if not spotify_activity:
                         await player.skip(force=True)
                         await update_panel_message(guild)
@@ -609,6 +612,18 @@ class Music(commands.Cog):
             error_msg = await message.channel.send("오류가 발생했습니다. 다시 시도해주세요.")
             asyncio.create_task(delete_message_later(error_msg, 3))
             logger.error(f"Music || 노래 재생 오류 발생 | Guild: {guild_id}, Channel: {channel_id}, Query: {message.content}, Err: {ex}")
+
+    # 활동 변화 감지, 스포티파이 활동 캐시 갱신
+    @commands.Cog.listener()
+    async def on_presence_update(self, before, after):
+        spotify_activity = next(
+            (a for a in after.activities if isinstance(a, discord.Spotify)),
+            None
+        )
+        if spotify_activity:
+            spotify_activity_cache[after.id] = spotify_activity
+        else:
+            spotify_activity_cache.pop(after.id, None)
 
     # 음성 채널 아무도 없으면 연결 해제
     @commands.Cog.listener()
