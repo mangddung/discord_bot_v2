@@ -394,7 +394,8 @@ class Music(commands.Cog):
         name="스포티파이", 
         description="사용자의 스포티파이 활동을 기준으로 노래를 재생합니다."
     )
-    async def spotify_play(self, interaction: discord.Interaction):
+    @app_commands.describe(member="연동할 사용자 (입력하지 않으면 본인 기준)")
+    async def spotify_play(self, interaction: discord.Interaction, member: discord.Member = None):
         await interaction.response.defer(ephemeral=True)
 
         # 보이스채널 참가 여부 확인
@@ -402,19 +403,26 @@ class Music(commands.Cog):
         if not member_voice:
             await interaction.followup.send("보이스채널에 참가 후 사용해주세요.")
             return
-        
-        member = interaction.guild.get_member(interaction.user.id)
-        if member is None:
+
+        target = member or interaction.guild.get_member(interaction.user.id)
+        if target is None:
             await interaction.followup.send("사용자의 활동을 찾을 수 없습니다. 잠시 후 다시 시도해주세요.")
             return
-        
+        if target.bot:
+            await interaction.followup.send("봇의 활동은 연동할 수 없습니다.")
+            return
+        # 재생/동기화가 대상 사용자 기준으로 동작하므로 같은 보이스채널에 있어야 함
+        if target.id != interaction.user.id and (not target.voice or target.voice.channel != member_voice.channel):
+            await interaction.followup.send("연동할 사용자가 같은 보이스채널에 있어야 합니다.")
+            return
+
         # 스포티파이 활동 찾기
-        spotify_activity = next(
-            (a for a in member.activities if isinstance(a, discord.Spotify)),
-            None
-        )
+        spotify_activity = get_spotify_activity(target)
         if not spotify_activity:
-            await interaction.followup.send("스포티파이 활동이 없어요.\n스포티파이 계정을 디스코드에 연결 후 노래를 재생한 상태에서 시도해주세요.")
+            if target.id == interaction.user.id:
+                await interaction.followup.send("스포티파이 활동이 없어요.\n스포티파이 계정을 디스코드에 연결 후 노래를 재생한 상태에서 시도해주세요.")
+            else:
+                await interaction.followup.send(f"{target.display_name}님의 스포티파이 활동이 없어요.")
             return
 
         # track_id로 현재곡 정보 조회
@@ -440,7 +448,7 @@ class Music(commands.Cog):
                     last_queue_id = 0
                     await interaction.followup.send(f"스포티파이 연동 재생: {search_result['title']}을(를) 재생합니다.")
                 
-                member_voice_channel = member.voice.channel
+                member_voice_channel = member_voice.channel
                 from utils.music_player import ChannelIdPlayer
                 bot_voice_client = interaction.guild.voice_client
 
@@ -457,7 +465,7 @@ class Music(commands.Cog):
                 # 대기열 DB에 추가
                 new_queue = Queues(
                     guild_id=interaction.guild_id,
-                    member_id=member.id,
+                    member_id=target.id,
                     video_id=search_result['id'],
                     video_title=search_result['title'],
                     video_thumbnail=search_result['thumbnail'],
@@ -474,7 +482,17 @@ class Music(commands.Cog):
 
                 # 노래 재생
                 asyncio.create_task(play_music(self, player, interaction.guild_id, search_result['id'], interaction, spotify_playback))
-                logger.info(f"Music || 🎵 {search_result['title']} 재생 시작 | Guild: {interaction.guild_id}, Music Id: {search_result['id']}, Duration: {search_result['duration']}, Requester : {member.id}")
+                logger.info(f"Music || 🎵 {search_result['title']} 재생 시작 | Guild: {interaction.guild_id}, Music Id: {search_result['id']}, Duration: {search_result['duration']}, Requester : {interaction.user.id}, Spotify: {target.id}")
+
+                # 다른 사용자 활동으로 연동한 경우 대상에게 DM 알림
+                if target.id != interaction.user.id:
+                    try:
+                        await target.send(
+                            f"**{interaction.guild.name}** 서버에서 {interaction.user.display_name}님이 "
+                            f"회원님의 스포티파이 활동으로 연동 재생을 시작했습니다."
+                        )
+                    except discord.Forbidden:
+                        logger.info(f"Music || 연동 재생 DM 발송 실패(DM 차단) | Guild: {interaction.guild_id}, Member: {target.id}")
         except Exception as ex:
             with get_db() as db:
                 db.rollback()
