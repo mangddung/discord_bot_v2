@@ -48,6 +48,8 @@ guild_locks = {}
 disconnect_tasks = {}
 # 스포티파이 활동 캐시 member_id -> discord.Spotify (스포티파이 활동은 계정 단위라 서버 구분 불필요)
 spotify_activity_cache = {}
+# 직전 로드 실패 곡 (guild_id -> video_id), 같은 곡 무한 재시도 방지
+load_failed_tracks = {}
 
 def get_spotify_activity(member):
     # 캐시 우선, 없으면 member.activities 폴백 (봇 시작 직후 presence 이벤트 수신 전 대비)
@@ -675,8 +677,29 @@ class Music(commands.Cog):
                 is_valid_reason = True
                 break
 
-        if is_valid_reason:
-            await play_next_music(self, player, guild_id)
+        if not is_valid_reason:
+            return
+
+        # 같은 곡 연속 로드 실패 시 재시도 중단
+        # (스포티파이 연동 곡은 실패해도 같은 곡을 다시 불러와 무한 재시도됨)
+        if reason_name in ("load_failed", "loadfailed") or reason_value in ("load_failed", "loadfailed"):
+            track_id = payload.track.identifier if payload.track else None
+            if load_failed_tracks.get(guild_id) == track_id:
+                load_failed_tracks.pop(guild_id, None)
+                with get_db() as db:
+                    first_queue = db.query(Queues).filter(Queues.guild_id==guild_id).order_by(Queues.id).first()
+                    if first_queue and first_queue.video_id == track_id:
+                        db.delete(first_queue)
+                        db.commit()
+                logger.warning(f"Music || 같은 곡 연속 재생 실패로 재시도 중단 | Guild: {guild_id}, Video: {track_id}")
+                start_disconnect_timer(guild_id, player)
+                await update_panel_message(player.guild)
+                return
+            load_failed_tracks[guild_id] = track_id
+        else:
+            load_failed_tracks.pop(guild_id, None)
+
+        await play_next_music(self, player, guild_id)
 
 #===============================================================================
 panel_message_list = {
