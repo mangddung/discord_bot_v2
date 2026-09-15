@@ -1,5 +1,6 @@
 import asyncio
 import time
+import aiohttp
 import discord
 import wavelink
 from discord import app_commands
@@ -323,12 +324,38 @@ async def sync_spotify(self):
                     db.close()
 
         await asyncio.sleep(5)
+# YouTube poToken 갱신 (pot-provider 발급 → Lavalink youtube 플러그인 반영)
+# 토큰 TTL 약 12시간, Lavalink 재시작 시 초기화되므로 노드 연결 시 + 주기적으로 갱신
+#========================================================================================
+POT_PROVIDER_URL = os.getenv('POT_PROVIDER_URL', 'http://pot-provider:4416')
+POT_REFRESH_INTERVAL = 6 * 60 * 60
+
+async def refresh_po_token():
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+            async with session.post(f"{POT_PROVIDER_URL}/get_pot", json={}) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+            body = {"poToken": data["poToken"], "visitorData": data["contentBinding"]}
+            for node in wavelink.Pool.nodes.values():
+                async with session.post(f"{node.uri}/youtube", json=body, headers={"Authorization": node.password}) as resp:
+                    resp.raise_for_status()
+        logger.info(f"Music || poToken 갱신 완료 | Nodes: {len(wavelink.Pool.nodes)}")
+    except Exception as ex:
+        logger.error(f"Music || poToken 갱신 실패 | Err: {ex!r}")
+
+async def po_token_loop():
+    while True:
+        await asyncio.sleep(POT_REFRESH_INTERVAL)
+        await refresh_po_token()
+
 # 디스코드 봇 이벤트
 #========================================================================================
 class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.spotify_task = None
+        self.pot_task = None
 
     @app_commands.command(
         name="전용채널", 
@@ -529,6 +556,8 @@ class Music(commands.Cog):
         if self.spotify_task is None or self.spotify_task.done():
             self.spotify_task = asyncio.create_task(sync_spotify(self))
             print("스포티파이 동기화 태스크 시작됨")
+        if self.pot_task is None or self.pot_task.done():
+            self.pot_task = asyncio.create_task(po_token_loop())
         with get_db() as db:
             try:
                 # 대기열 데이터 삭제
@@ -680,6 +709,12 @@ class Music(commands.Cog):
                 if member_count == 0:
                     await self.bot.voice_clients[0].disconnect()
                     logger.info(f"Music || 음성 채널에 아무도 없어서 연결 해제 | Guild: {member.guild.id}, Channel: {voice_channel.id}")
+
+    # Lavalink 노드 연결 시 poToken 반영 (Lavalink 재시작하면 토큰 초기화됨)
+    @commands.Cog.listener()
+    async def on_wavelink_node_ready(self, payload: wavelink.NodeReadyEventPayload):
+        if not payload.resumed:
+            await refresh_po_token()
 
     # wavelink 트랙 종료 이벤트 (자동 다음 곡 재생)
     @commands.Cog.listener()

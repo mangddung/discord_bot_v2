@@ -15,6 +15,8 @@ services:
     depends_on:
       lavalink:
         condition: service_healthy
+      pot-provider:
+        condition: service_started
 
   # 기본 Lavalink 노드 (node1)
   lavalink:
@@ -47,6 +49,14 @@ services:
     environment:
       - TZ=Asia/Seoul
       - OVERRIDE_PLAYER_VARIANT=IAS
+
+  # YouTube poToken 발급 서버 (WEB/MWEB 스트림용). 인증 없는 서버라 호스트 포트 미개방, 내부 네트워크 전용
+  pot-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:1.3.2-node
+    container_name: pot-provider
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Seoul
 
   # 노드 추가 예시 (.env의 LAVALINK_NODES에도 동일한 identifier/host로 항목 추가 필요):
   # lavalink2:
