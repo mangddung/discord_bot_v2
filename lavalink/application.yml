@@ -4,9 +4,10 @@ server:
 
 lavalink:
   plugins:
-    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"
-      snapshot: false
-      repository: "https://maven.lavalink.dev/releases"
+    # 1.18.2 이후 미릴리스 수정(클라이언트 버전, TV User-Agent, IOS, contentLength 누락 포맷 길이 복구) 포함 main 커밋 고정 (2026-08-19)
+    - dependency: "dev.lavalink.youtube:youtube-plugin:f45bbb7aebfcbc1c553769e04af6cd43afa8b7c3"
+      snapshot: true
+      repository: "https://maven.lavalink.dev/snapshots"
   server:
     password: "${LAVALINK_PASSWORD}"
     sources:
@@ -19,15 +20,14 @@ plugins:
   youtube:
     enabled: true
     oauth:
-      enabled: true
-      skipInitialization: false
+      enabled: false
     clients:
       - MUSIC
       - TVHTML5_SIMPLY
       - MWEB
-      - IOS
       - ANDROID_VR
       - WEB
+      - IOS
     remoteCipher:
       url: "http://yt-cipher:8001/"
     allowSearch: true
