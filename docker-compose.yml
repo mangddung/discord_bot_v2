@@ -38,6 +38,16 @@ services:
       retries: 10
       start_period: 15s
 
+  # YouTube 서명 복호화 서버 (lavalink remoteCipher). 호스트 포트 미개방, 내부 네트워크 전용
+  # 태그가 master뿐이라 digest로 고정 (2026-08-06 빌드)
+  yt-cipher:
+    image: ghcr.io/kikkia/yt-cipher@sha256:4c5ec381ff57336cfc24822d2b526a5ad7cd0171f61065a1bbc87bb736842449
+    container_name: yt-cipher
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Seoul
+      - OVERRIDE_PLAYER_VARIANT=IAS
+
   # 노드 추가 예시 (.env의 LAVALINK_NODES에도 동일한 identifier/host로 항목 추가 필요):
   # lavalink2:
   #   image: ghcr.io/lavalink-devs/lavalink:4

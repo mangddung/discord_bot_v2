@@ -23,9 +23,13 @@ plugins:
       skipInitialization: false
     clients:
       - MUSIC
+      - TVHTML5_SIMPLY
+      - MWEB
+      - IOS
       - ANDROID_VR
-      - TVHTML5EMBEDDED
       - WEB
+    remoteCipher:
+      url: "http://yt-cipher:8001/"
     allowSearch: true
     allowDirectVideoIds: true
     allowDirectPlaylistIds: true
