@@ -349,6 +349,25 @@ async def po_token_loop():
         await asyncio.sleep(POT_REFRESH_INTERVAL)
         await refresh_po_token()
 
+# Lavalink 재연결 감시
+# wavelink 3.4.1은 Lavalink 종료 시 받는 CLOSE 메시지를 처리하지 못해 keep_alive 태스크가 죽고 재연결을 안 함
+# → 죽은 연결을 정리하고 Pool.reconnect로 재연결 (재연결 실패/재시도 소진 노드도 같이 재시도)
+#========================================================================================
+LAVALINK_WATCHDOG_INTERVAL = 30
+
+async def lavalink_watchdog_loop():
+    while True:
+        await asyncio.sleep(LAVALINK_WATCHDOG_INTERVAL)
+        try:
+            for node in wavelink.Pool.nodes.values():
+                ws = node._websocket
+                if node.status is wavelink.NodeStatus.CONNECTED and ws and ws.keep_alive_task and ws.keep_alive_task.done():
+                    logger.warning(f"Music || Lavalink 연결 끊김 감지, 재연결 시도 | Node: {node.identifier}")
+                    await ws.cleanup()
+            await wavelink.Pool.reconnect()
+        except Exception as ex:
+            logger.error(f"Music || Lavalink 재연결 실패 | Err: {ex!r}")
+
 # 디스코드 봇 이벤트
 #========================================================================================
 class Music(commands.Cog):
@@ -356,6 +375,7 @@ class Music(commands.Cog):
         self.bot = bot
         self.spotify_task = None
         self.pot_task = None
+        self.watchdog_task = None
 
     @app_commands.command(
         name="전용채널", 
@@ -558,6 +578,8 @@ class Music(commands.Cog):
             print("스포티파이 동기화 태스크 시작됨")
         if self.pot_task is None or self.pot_task.done():
             self.pot_task = asyncio.create_task(po_token_loop())
+        if self.watchdog_task is None or self.watchdog_task.done():
+            self.watchdog_task = asyncio.create_task(lavalink_watchdog_loop())
         with get_db() as db:
             try:
                 # 대기열 데이터 삭제
@@ -710,11 +732,28 @@ class Music(commands.Cog):
                     await self.bot.voice_clients[0].disconnect()
                     logger.info(f"Music || 음성 채널에 아무도 없어서 연결 해제 | Guild: {member.guild.id}, Channel: {voice_channel.id}")
 
-    # Lavalink 노드 연결 시 poToken 반영 (Lavalink 재시작하면 토큰 초기화됨)
+    # Lavalink 노드 새 세션 연결 시 처리 (Lavalink 재시작하면 토큰·플레이어 초기화됨)
     @commands.Cog.listener()
     async def on_wavelink_node_ready(self, payload: wavelink.NodeReadyEventPayload):
-        if not payload.resumed:
-            await refresh_po_token()
+        if payload.resumed:
+            return
+
+        # 이전 세션의 플레이어는 새 세션에 없어 재생 불가(404) → 음성 연결 해제 후 대기열 정리
+        for vc in list(self.bot.voice_clients):
+            if not isinstance(vc, wavelink.Player) or vc.node is not payload.node:
+                continue
+            guild = vc.guild
+            try:
+                await vc.disconnect()
+                with get_db() as db:
+                    db.query(Queues).filter(Queues.guild_id==guild.id).delete()
+                    db.commit()
+                await update_panel_message(guild)
+                logger.warning(f"Music || Lavalink 세션 재생성으로 음성 연결 해제 및 대기열 초기화 | Guild: {guild.id}")
+            except Exception as ex:
+                logger.error(f"Music || Lavalink 세션 재생성 후 정리 실패 | Guild: {guild.id}, Err: {ex!r}")
+
+        await refresh_po_token()
 
     # wavelink 트랙 종료 이벤트 (자동 다음 곡 재생)
     @commands.Cog.listener()
