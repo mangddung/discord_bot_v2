@@ -1,4 +1,5 @@
 import asyncio
+import time
 import discord
 import wavelink
 from discord import app_commands
@@ -82,6 +83,26 @@ def cancel_disconnect_timer(guild_id):
 
 # 음악 재생 관련 함수 (wavelink)
 #========================================================================================
+async def play_track(player: wavelink.Player, track: wavelink.Playable, start_ms: int = 0):
+    # YouTube 스트림은 시작 위치를 지정해 재생하면 403 → 0초로 재생 후 실제 재생이 시작되면 seek
+    await player.play(track)
+    if start_ms <= 0:
+        return
+
+    # 재생 후 첫 playerUpdate 대기 (wavelink는 이전 곡 위치를 초기화하지 않아 갱신 시각으로 판단)
+    loop = asyncio.get_running_loop()
+    begin = loop.time()
+    begin_ns = time.monotonic_ns()
+    while loop.time() - begin < 5:
+        if player._last_update and player._last_update > begin_ns and player._last_position > 0:
+            break
+        await asyncio.sleep(0.25)
+
+    # 대기 중 스킵 등으로 곡이 바뀌었으면 seek 생략
+    if player.current is None or player.current.identifier != track.identifier:
+        return
+    await player.seek(start_ms + int((loop.time() - begin) * 1000))
+
 async def play_next_music(self, player: wavelink.Player, guild_id):
     try:
         with get_db() as db:
@@ -204,7 +225,7 @@ async def play_next_music(self, player: wavelink.Player, guild_id):
                     await play_next_music(self, player, guild_id)
                     return
 
-                await player.play(tracks[0], start=start_seconds * 1000)
+                await play_track(player, tracks[0], start_seconds * 1000)
                 cancel_disconnect_timer(str(guild_id))
 
             # 임베드 업데이트
@@ -240,7 +261,7 @@ async def play_music(self, player: wavelink.Player, guild_id, yt_id, interaction
                 return
 
             try:
-                await player.play(tracks[0], start=start_seconds * 1000)
+                await play_track(player, tracks[0], start_seconds * 1000)
                 cancel_disconnect_timer(str(guild_id))
             except Exception as ex:
                 logger.error(f"Music || 재생 오류 | Guild: {guild_id}, Video: {yt_id}, Err: {ex}")
