@@ -14,6 +14,7 @@ cogs/z_*.py
 .claude/
 memory-bank/
 docs/
+db/
 
 music-bot-app-main/
 presence_flicker.py
