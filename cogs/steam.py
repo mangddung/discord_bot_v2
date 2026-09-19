@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from db import Base, get_db
 from sqlalchemy import Column, String, Integer, DateTime
 from utils import *
+from utils import exchange_rate
 import json
 import sys
 import os
@@ -181,94 +182,6 @@ def resolve_regions(author_id, guild_id):
         ]
 
 # ========================================================================================
-# ST1: 환율 데이터 (open.er-api.com, USD 기준)
-# ========================================================================================
-EXCHANGE_API_URL = "https://open.er-api.com/v6/latest/USD"
-
-# exchange.json 경로
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-DB_DIR = os.path.join(BASE_DIR, 'db')
-EXCHANGE_FILE = os.path.join(DB_DIR, 'exchange.json')
-
-if not os.path.exists(DB_DIR):
-    os.makedirs(DB_DIR)
-
-# 환율 데이터 캐시 (ST3.4: 스레드 안전성을 위해 Lock 사용)
-exchange_data = None
-exchange_lock = asyncio.Lock()
-
-def _load_exchange_file():
-    """exchange.json 파일에서 환율 데이터 로드 (없으면 None)"""
-    global exchange_data
-    if os.path.isfile(EXCHANGE_FILE):
-        try:
-            with open(EXCHANGE_FILE, 'r', encoding='utf-8') as f:
-                exchange_data = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Steam || exchange.json 로드 실패: {e}")
-            exchange_data = None
-
-def save_exchange_config(data):
-    with open(EXCHANGE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-# 초기 로드 (파일이 있으면 사용, 없으면 None — ST3.7: sys.exit 대신 폴백)
-_load_exchange_file()
-
-async def fetch_exchange_rate(session: aiohttp.ClientSession):
-    """open.er-api.com 에서 환율 데이터 조회 (USD 기준)"""
-    try:
-        async with session.get(EXCHANGE_API_URL, timeout=aiohttp.ClientTimeout(total=15)) as res:
-            if res.status != 200:
-                logger.error(f'Steam || 환율 API 요청 실패: HTTP {res.status}')
-                return None
-            data = await res.json()
-            if data.get("result") != "success":
-                logger.error('Steam || 환율 API 응답 오류')
-                return None
-            return data
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.error(f'Steam || 환율 API 요청 예외: {e}')
-        return None
-
-async def update_exchange_rate(session: aiohttp.ClientSession):
-    """환율 데이터 갱신 (Lock 보호)"""
-    global exchange_data
-    data = await fetch_exchange_rate(session)
-    if data:
-        async with exchange_lock:
-            exchange_data = data
-            save_exchange_config(data)
-        base_cur = DEFAULT_PRIMARY_REGION['currency']
-        comp_cur = DEFAULT_SECONDARY_REGION['currency']
-        rates = data.get('rates', {})
-        if base_cur in rates and comp_cur in rates:
-            logger.info(f"Steam || 환율 갱신: 1 {comp_cur} ≈ {rates[base_cur]/rates[comp_cur]:.2f} {base_cur} ({data.get('time_last_update_utc')})")
-        else:
-            logger.info(f"Steam || 환율 갱신 완료 ({data.get('time_last_update_utc')})")
-
-def is_exchange_stale():
-    """환율 데이터가 1시간 이상 경과했는지 확인 (ST1)"""
-    if not exchange_data:
-        return True
-    last_update = exchange_data.get('time_last_update_unix')
-    if not last_update:
-        return True
-    now_unix = int(datetime.now(timezone.utc).timestamp())
-    return (now_unix - int(last_update)) > 3600
-
-async def update_exchange_if_stale(session: aiohttp.ClientSession):
-    if is_exchange_stale():
-        await update_exchange_rate(session)
-
-# 1시간마다 환율 갱신 (ST1)
-async def exchange_rate_updater():
-    async with aiohttp.ClientSession() as session:
-        while True:
-            await asyncio.sleep(60 * 60)
-            await update_exchange_rate(session)
-
-# ========================================================================================
 # ST3.1: 비동기 게임 정보 조회
 # ========================================================================================
 async def get_game_info(session: aiohttp.ClientSession, app_id, regions):
@@ -306,10 +219,8 @@ async def get_game_info(session: aiohttp.ClientSession, app_id, regions):
     if game_info['is_free']:
         return game_info
 
-    # 환율 데이터 복사본 (ST3.4: Lock 없이 읽기)
-    rates = None
-    if exchange_data:
-        rates = exchange_data.get('rates', {})
+    # 환율 데이터 (ST3.4: Lock 없이 읽기)
+    rates = exchange_rate.get_rates()
 
     # 각 지역별 가격 조회
     for idx, region in enumerate(regions):
@@ -582,8 +493,6 @@ class Steam(commands.Cog):
 async def setup(bot: commands.Bot) -> None:
     # ST1: 환율 초기화 (파일이 없거나 stale하면 갱신 시도)
     cog = Steam(bot)
-    async with aiohttp.ClientSession() as init_session:
-        await update_exchange_if_stale(init_session)
-    asyncio.create_task(exchange_rate_updater())
+    await exchange_rate.start()
     bot.tree.add_command(SteamSettingCommand(bot))
     await bot.add_cog(cog)
