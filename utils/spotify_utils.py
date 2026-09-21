@@ -22,6 +22,7 @@ def get_track_info(activity):
 
     track_info = sp.track(activity.track_id)
     result = {
+        "track_id": activity.track_id,
         "isrc": track_info["external_ids"].get("isrc"),
         "name": track_info.get("name"),
         "artist": track_info["artists"][0]["name"] if track_info.get("artists") else None,

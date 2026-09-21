@@ -53,6 +53,32 @@ spotify_activity_cache = {}
 # 직전 로드 실패 곡 (guild_id -> video_id), 같은 곡 무한 재시도 방지
 load_failed_tracks = {}
 
+# 스포티파이 연동 동기화 (presence 이벤트 기반)
+# 첫 이벤트는 즉시 동기화, 이후 이 시간 동안 들어온 이벤트는 모아서 마지막 기준으로 동기화 (여러 곡 연속 넘기기 대비)
+SPOTIFY_SYNC_INTERVAL = 3
+# 스포티파이 활동 중지 시 일시정지 유지 시간, 초과하면 연동 종료
+SPOTIFY_PAUSE_TIMEOUT = 60
+# 스포티파이와 재생 위치 차이가 이 값 이상이면 seek
+SPOTIFY_SEEK_THRESHOLD_MS = 2000
+# 동기화 스로틀 태스크 (member_id -> asyncio.Task), 대기 구간 중 이벤트 수신한 member_id
+spotify_sync_tasks = {}
+spotify_sync_pending = set()
+# 활동 중지 일시정지 타이머 (guild_id -> asyncio.Task)
+spotify_pause_tasks = {}
+# 현재 연동 재생 중인 스포티파이 track_id (guild_id -> track_id)
+spotify_track_ids = {}
+
+def get_guild_lock(guild_id):
+    # guild_id가 str/int 혼용되어 int로 통일
+    return guild_locks.setdefault(int(guild_id), asyncio.Lock())
+
+def cancel_spotify_pause(guild_id):
+    # 활동 중지로 일시정지한 상태였으면 True
+    task = spotify_pause_tasks.pop(int(guild_id), None)
+    if task and not task.done():
+        task.cancel()
+    return task is not None
+
 def get_spotify_activity(member):
     # 캐시 우선, 없으면 member.activities 폴백 (봇 시작 직후 presence 이벤트 수신 전 대비)
     cached = spotify_activity_cache.get(member.id)
@@ -104,7 +130,8 @@ async def play_track(player: wavelink.Player, track: wavelink.Playable, start_ms
         return
     await player.seek(start_ms + int((loop.time() - begin) * 1000))
 
-async def play_next_music(self, player: wavelink.Player, guild_id):
+# finished: 곡이 끝까지 재생되어 호출된 경우 (스킵·중지 아님)
+async def play_next_music(self, player: wavelink.Player, guild_id, finished=False):
     try:
         with get_db() as db:
             first_queue_db = db.query(Queues).filter(Queues.guild_id==guild_id).order_by(Queues.id).first()
@@ -122,28 +149,28 @@ async def play_next_music(self, player: wavelink.Player, guild_id):
             # 스포티파이 연동 재생 확인
             spotify_playback = None
             if first_queue_db.is_spotify:
+                spotify_activity = get_spotify_activity(member)
+                has_next = db.query(Queues).filter(Queues.guild_id==guild_id).order_by(Queues.id).offset(1).first() is not None
+
+                # 유튜브 곡이 먼저 끝났는데 스포티파이는 아직 같은 곡이면 곡 변경 이벤트까지 대기
+                if finished and not has_next and spotify_activity and spotify_activity.track_id == spotify_track_ids.get(int(guild_id)):
+                    return
+
                 # 재생 완료 곡 삭제
                 db.delete(first_queue_db)
                 db.commit()
 
-                # 스포티파이 활동 찾기
-                spotify_activity = get_spotify_activity(member)
-                if not spotify_activity:
-                    return
-
-                # track_id로 현재곡 정보 조회
-                spotify_playback = get_track_info(spotify_activity)
-                if not spotify_playback:
-                    return
-
-                # playback 정보로 유튜브 노래 검색
-                search_result = playback_youtube_search(spotify_playback)
-                if not search_result:
-                    return
-
                 # 새로운 곡 DB에 추가 (대기열 우선)
                 next_queue = db.query(Queues).filter(Queues.guild_id==guild_id).order_by(Queues.id).first()
                 if not next_queue:
+                    # 스포티파이 현재 곡 조회 → 유튜브 검색, 실패하면(활동 없음 등) 연동 종료
+                    spotify_playback = await asyncio.to_thread(get_track_info, spotify_activity) if spotify_activity else None
+                    search_result = await asyncio.to_thread(playback_youtube_search, spotify_playback) if spotify_playback else None
+                    if not search_result:
+                        start_disconnect_timer(str(guild_id), player)
+                        await update_panel_message(guild)
+                        return
+
                     try:
                         last_queue = db.query(Queues).filter(Queues.guild_id == guild_id).order_by(desc(Queues.id)).first()
                         if last_queue:
@@ -179,8 +206,9 @@ async def play_next_music(self, player: wavelink.Player, guild_id):
                     next_music = db.query(Queues).filter(Queues.guild_id==guild_id).order_by(Queues.id).first()
 
             if next_music:
-                # 요청자, 봇 채널 확인
-                member_voice = member.voice
+                # 다음 곡 요청자, 봇 채널 확인
+                member = guild.get_member(int(next_music.member_id))
+                member_voice = member.voice if member else None
 
                 # 보이스 채널에 없으면 스킵
                 if member_voice:
@@ -198,23 +226,19 @@ async def play_next_music(self, player: wavelink.Player, guild_id):
                 if next_music.is_spotify and spotify_playback is None:
                     # 다음 곡 스포티파이 활동 가져오기
                     spotify_activity = get_spotify_activity(member)
-                    if not spotify_activity:
-                        # 다음곡 요청한 유저가 스포티파이 재생중이 아니면 생략
-                        db.delete(next_music)
-                        db.commit()
-                        return
-                    spotify_playback = get_track_info(spotify_activity)
+                    spotify_playback = await asyncio.to_thread(get_track_info, spotify_activity) if spotify_activity else None
                     if not spotify_playback:
-                        db.delete(next_music)
-                        db.commit()
+                        # 다음곡 요청한 유저가 스포티파이 재생중이 아니면 생략하고 그 다음 곡 진행
+                        await play_next_music(self, player, guild_id)
                         return
 
                 # 스포티파이 재생인 경우 시작 위치 계산
                 if next_music.is_spotify:
+                    spotify_track_ids[int(guild_id)] = spotify_playback['track_id']
                     start_poition_result = get_spotify_start_position(spotify_playback)
                     if start_poition_result["should_skip"]:
-                        db.delete(next_music)
-                        db.commit()
+                        # 곧 끝나는 곡이면 재생하지 않고 곡 변경 이벤트까지 대기
+                        await update_panel_message(guild)
                         return
 
                     start_seconds = start_poition_result["start_seconds"]
@@ -226,6 +250,9 @@ async def play_next_music(self, player: wavelink.Player, guild_id):
                     await play_next_music(self, player, guild_id)
                     return
 
+                # 활동 중지로 일시정지 중이었으면 해제 (play는 일시정지 상태 유지)
+                if cancel_spotify_pause(guild_id):
+                    await player.pause(False)
                 await play_track(player, tracks[0], start_seconds * 1000)
                 cancel_disconnect_timer(str(guild_id))
 
@@ -239,17 +266,25 @@ async def play_next_music(self, player: wavelink.Player, guild_id):
 
 async def play_music(self, player: wavelink.Player, guild_id, yt_id, interaction=None, spotify_playback=None):
     # 재생 프로세스 중복 요청 방지
-    if guild_id not in guild_locks:
-        guild_locks[guild_id] = asyncio.Lock()
-    lock = guild_locks[guild_id]
-    async with lock:
+    async with get_guild_lock(guild_id):
+        # 스포티파이 연동이 대기 중(활동 중지 일시정지·곡 변경 대기)일 때 곡이 추가되면 연동 종료 후 바로 재생
+        with get_db() as db:
+            queue_count = db.query(Queues).filter(Queues.guild_id==guild_id).count()
+        if queue_count > 1 and current_spotify_member(guild_id) is not None and (int(guild_id) in spotify_pause_tasks or player.current is None):
+            if cancel_spotify_pause(guild_id):
+                await player.pause(False)
+            await advance_queue(self, player, guild_id)
+            return
+
         if not player.playing:
             # 스포티파이 연동 재생인 경우
             if spotify_playback:
+                spotify_track_ids[int(guild_id)] = spotify_playback['track_id']
                 result = get_spotify_start_position(spotify_playback)
                 if result["should_skip"]:
+                    # 곡 변경 이벤트 수신 시 다음 곡부터 자동 재생
                     if interaction:
-                        await interaction.followup.send("해당 곡은 곧 끝나기 때문에 재생이 생략되었습니다. 잠시 후 다시 시도해주세요.")
+                        await interaction.followup.send("해당 곡은 곧 끝나기 때문에 다음 곡부터 재생합니다.")
                     return
                 start_seconds = result["start_seconds"]
             else:
@@ -267,63 +302,110 @@ async def play_music(self, player: wavelink.Player, guild_id, yt_id, interaction
             except Exception as ex:
                 logger.error(f"Music || 재생 오류 | Guild: {guild_id}, Video: {yt_id}, Err: {ex}")
 
-# 스포티파이 주기적 동기화
-async def sync_spotify(self):
-    while True:
-        for guild in self.bot.guilds:
-            with get_db() as db:
-                try:
-                    # DB로 스포티파이 재생 확인
-                    current_queue = db.query(Queues).filter(Queues.guild_id==guild.id).order_by(Queues.id).first()
-                    if not current_queue:
-                        continue
-                    if not current_queue.is_spotify:
-                        continue
+# 스포티파이 연동 동기화 (presence 이벤트 기반)
+#========================================================================================
+def current_spotify_member(guild_id):
+    # 현재 재생 곡(대기열 첫 번째)이 스포티파이 연동이면 연동 대상 member_id
+    with get_db() as db:
+        current = db.query(Queues).filter(Queues.guild_id==guild_id).order_by(Queues.id).first()
+        if current and current.is_spotify:
+            return current.member_id
+    return None
 
-                    # wavelink player 가져오기
-                    player = guild.voice_client
-                    if not player or not player.connected:
-                        continue
+async def advance_queue(self, player: wavelink.Player, guild_id):
+    # 다음 곡으로 진행 (길드 락을 잡은 상태에서 호출)
+    if player.current:
+        await player.skip(force=True)  # track_end 이벤트에서 play_next_music 진행
+    else:
+        await play_next_music(self, player, str(guild_id))
 
-                    # 멤버 가져오기
-                    member = guild.get_member(current_queue.member_id)
-                    if not member:
-                        continue
+def get_spotify_targets(self, member_id):
+    # 해당 멤버의 스포티파이로 연동 재생 중인 (guild, player) 목록
+    targets = []
+    for guild in self.bot.guilds:
+        player = guild.voice_client
+        if player and player.connected and current_spotify_member(guild.id) == member_id:
+            targets.append((guild, player))
+    return targets
 
-                    # 스포티파이 활동 가져오기
-                    spotify_activity = get_spotify_activity(member)
-                    if not spotify_activity:
-                        await player.skip(force=True)
-                        await update_panel_message(guild)
-                        continue
+def schedule_spotify_sync(self, member_id):
+    # 대기 구간 중이면 표시만, 아니면 즉시 동기화 시작
+    if member_id in spotify_sync_tasks:
+        spotify_sync_pending.add(member_id)
+        return
+    spotify_sync_pending.discard(member_id)
+    spotify_sync_tasks[member_id] = asyncio.create_task(_spotify_sync_throttle(self, member_id))
 
-                    # track_id로 현재곡 정보 조회
-                    spotify_playback = get_track_info(spotify_activity)
-                    if not spotify_playback:
-                        continue
+async def _spotify_sync_throttle(self, member_id):
+    try:
+        await sync_spotify_member(self, member_id)
+        # 대기 구간 동안 이벤트가 있었으면 최신 활동 기준으로 다시 동기화
+        while True:
+            await asyncio.sleep(SPOTIFY_SYNC_INTERVAL)
+            if member_id not in spotify_sync_pending:
+                break
+            spotify_sync_pending.discard(member_id)
+            await sync_spotify_member(self, member_id)
+    finally:
+        spotify_sync_tasks.pop(member_id, None)
 
-                    # isrc 값으로 확인
-                    if current_queue.isrc:
-                        if spotify_playback['isrc'] == current_queue.isrc:
-                            continue
-                    # isrc없으면 유튜브 id로 비교
-                    else:
-                        # playback으로 검색
-                        current_playback = playback_youtube_search(spotify_playback)
-                        if not current_playback:
-                            continue
-                        # 검색 결과 id 가 현재 곡과 같은 경우
-                        if current_playback['id'] == current_queue.video_id:
-                            continue
+async def sync_spotify_member(self, member_id):
+    activity = spotify_activity_cache.get(member_id)
+    if not activity:
+        return
 
-                    # 다르면 현재 곡으로 재생(스킵 기능으로)
-                    await player.skip(force=True)
-                except Exception as e:
-                    print(f'sync_spotify error: {e}')
-                finally:
-                    db.close()
+    for guild, player in get_spotify_targets(self, member_id):
+        async with get_guild_lock(guild.id):
+            try:
+                if current_spotify_member(guild.id) != member_id:
+                    continue
+                if cancel_spotify_pause(guild.id):
+                    await player.pause(False)
 
-        await asyncio.sleep(5)
+                # 곡이 바뀌었거나 재생 중인 곡이 없으면(곡 변경 대기 중) 현재 곡으로 재생
+                if spotify_track_ids.get(guild.id) != activity.track_id or player.current is None:
+                    await advance_queue(self, player, guild.id)
+                    continue
+
+                # 같은 곡이면 재생 위치 차이만 보정
+                if activity.start:
+                    expected_ms = int((discord.utils.utcnow() - activity.start).total_seconds() * 1000)
+                    if 0 <= expected_ms < player.current.length and abs(expected_ms - player.position) > SPOTIFY_SEEK_THRESHOLD_MS:
+                        await player.seek(expected_ms)
+            except Exception as ex:
+                logger.error(f"Music || 스포티파이 동기화 오류 | Guild: {guild.id}, Member: {member_id}, Err: {ex!r}")
+
+async def on_spotify_stopped(self, member_id):
+    # 활동 중지: 다음 대기열 있으면 바로 진행, 없으면 일시정지 후 타이머
+    spotify_sync_pending.discard(member_id)
+
+    for guild, player in get_spotify_targets(self, member_id):
+        async with get_guild_lock(guild.id):
+            try:
+                if current_spotify_member(guild.id) != member_id:
+                    continue
+                with get_db() as db:
+                    has_next = db.query(Queues).filter(Queues.guild_id==guild.id).count() > 1
+                if has_next:
+                    await advance_queue(self, player, guild.id)
+                elif guild.id not in spotify_pause_tasks:
+                    await player.pause(True)
+                    spotify_pause_tasks[guild.id] = asyncio.create_task(_spotify_pause_timeout(self, guild, player, member_id))
+            except Exception as ex:
+                logger.error(f"Music || 스포티파이 활동 중지 처리 오류 | Guild: {guild.id}, Member: {member_id}, Err: {ex!r}")
+
+async def _spotify_pause_timeout(self, guild, player: wavelink.Player, member_id):
+    await asyncio.sleep(SPOTIFY_PAUSE_TIMEOUT)
+    spotify_pause_tasks.pop(guild.id, None)
+    async with get_guild_lock(guild.id):
+        try:
+            await player.pause(False)
+            if player.connected and current_spotify_member(guild.id) == member_id:
+                await advance_queue(self, player, guild.id)
+                logger.info(f"Music || 스포티파이 활동 중지 {SPOTIFY_PAUSE_TIMEOUT}초 초과로 연동 종료 | Guild: {guild.id}, Member: {member_id}")
+        except Exception as ex:
+            logger.error(f"Music || 스포티파이 연동 종료 오류 | Guild: {guild.id}, Member: {member_id}, Err: {ex!r}")
+
 # YouTube poToken 갱신 (pot-provider 발급 → Lavalink youtube 플러그인 반영)
 # 토큰 TTL 약 12시간, Lavalink 재시작 시 초기화되므로 노드 연결 시 + 주기적으로 갱신
 #========================================================================================
@@ -373,7 +455,6 @@ async def lavalink_watchdog_loop():
 class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.spotify_task = None
         self.pot_task = None
         self.watchdog_task = None
 
@@ -496,13 +577,13 @@ class Music(commands.Cog):
             return
 
         # track_id로 현재곡 정보 조회
-        spotify_playback = get_track_info(spotify_activity)
+        spotify_playback = await asyncio.to_thread(get_track_info, spotify_activity)
         if not spotify_playback:
             await interaction.followup.send("현재곡 정보 검색 실패.")
-            return  
-        
+            return
+
         # playback 정보로 유튜브 노래 검색
-        search_result = playback_youtube_search(spotify_playback)
+        search_result = await asyncio.to_thread(playback_youtube_search, spotify_playback)
         if not search_result:
             await interaction.followup.send("재생중인 스포티파이 곡으로 유튜브 영상 검색에 실패했습니다.")
             return
@@ -573,9 +654,6 @@ class Music(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
 
-        if self.spotify_task is None or self.spotify_task.done():
-            self.spotify_task = asyncio.create_task(sync_spotify(self))
-            print("스포티파이 동기화 태스크 시작됨")
         if self.pot_task is None or self.pot_task.done():
             self.pot_task = asyncio.create_task(po_token_loop())
         if self.watchdog_task is None or self.watchdog_task.done():
@@ -712,10 +790,23 @@ class Music(commands.Cog):
             (a for a in after.activities if isinstance(a, discord.Spotify)),
             None
         )
+        cached = spotify_activity_cache.get(after.id)
         if spotify_activity:
             spotify_activity_cache[after.id] = spotify_activity
         else:
             spotify_activity_cache.pop(after.id, None)
+
+        # 같은 이벤트가 봇과 겹치는 서버 수만큼 수신 → 캐시와 달라진 경우만 처리
+        if spotify_activity is None:
+            if cached is not None:
+                await on_spotify_stopped(self, after.id)
+            return
+        if cached and cached.track_id == spotify_activity.track_id:
+            if not (cached.start and spotify_activity.start):
+                return
+            if abs((cached.start - spotify_activity.start).total_seconds()) < 1:
+                return
+        schedule_spotify_sync(self, after.id)
 
     # 음성 채널 아무도 없으면 연결 해제
     @commands.Cog.listener()
@@ -794,7 +885,8 @@ class Music(commands.Cog):
         else:
             load_failed_tracks.pop(guild_id, None)
 
-        await play_next_music(self, player, guild_id)
+        async with get_guild_lock(guild_id):
+            await play_next_music(self, player, guild_id, finished="finished" in (reason_name, reason_value, reason_str))
 
 #===============================================================================
 panel_message_list = {
