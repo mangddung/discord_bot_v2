@@ -108,6 +108,18 @@ def cancel_disconnect_timer(guild_id):
     if task and not task.done():
         task.cancel()
 
+async def disconnect_and_clear(guild, player: wavelink.Player):
+    # 음성 연결 해제(lavalink 플레이어 삭제) + 대기열·타이머 정리 + 패널 업데이트
+    async with get_guild_lock(guild.id):
+        cancel_disconnect_timer(str(guild.id))
+        cancel_spotify_pause(guild.id)
+        spotify_track_ids.pop(guild.id, None)
+        await player.disconnect()
+        with get_db() as db:
+            db.query(Queues).filter(Queues.guild_id==guild.id).delete()
+            db.commit()
+    await update_panel_message(guild)
+
 # 음악 재생 관련 함수 (wavelink)
 #========================================================================================
 async def play_track(player: wavelink.Player, track: wavelink.Playable, start_ms: int = 0):
@@ -811,17 +823,15 @@ class Music(commands.Cog):
     # 음성 채널 아무도 없으면 연결 해제
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
-        if self.bot.voice_clients:  # 봇이 음성 채널에 연결되어 있는지 확인
-            voice_channel = self.bot.voice_clients[0].channel  # 봇이 연결된 음성 채널 객체 가져오기
-            if voice_channel: # voice_channel이 None이 아닌지 확인 (봇이 연결이 끊어졌을 경우를 대비)
-                members_in_channel = voice_channel.members  # 채널에 있는 멤버 목록 가져오기
-                member_count = 0
-                for member in members_in_channel:
-                    if not member.bot:
-                        member_count += 1
-                if member_count == 0:
-                    await self.bot.voice_clients[0].disconnect()
-                    logger.info(f"Music || 음성 채널에 아무도 없어서 연결 해제 | Guild: {member.guild.id}, Channel: {voice_channel.id}")
+        # 이벤트 발생한 서버의 봇 음성 연결만 확인
+        player = member.guild.voice_client
+        if not player or not player.connected or not player.channel:
+            return
+        voice_channel = player.channel
+        if any(not m.bot for m in voice_channel.members):
+            return
+        await disconnect_and_clear(member.guild, player)
+        logger.info(f"Music || 음성 채널에 아무도 없어서 연결 해제 | Guild: {member.guild.id}, Channel: {voice_channel.id}")
 
     # Lavalink 노드 새 세션 연결 시 처리 (Lavalink 재시작하면 토큰·플레이어 초기화됨)
     @commands.Cog.listener()
@@ -835,11 +845,7 @@ class Music(commands.Cog):
                 continue
             guild = vc.guild
             try:
-                await vc.disconnect()
-                with get_db() as db:
-                    db.query(Queues).filter(Queues.guild_id==guild.id).delete()
-                    db.commit()
-                await update_panel_message(guild)
+                await disconnect_and_clear(guild, vc)
                 logger.warning(f"Music || Lavalink 세션 재생성으로 음성 연결 해제 및 대기열 초기화 | Guild: {guild.id}")
             except Exception as ex:
                 logger.error(f"Music || Lavalink 세션 재생성 후 정리 실패 | Guild: {guild.id}, Err: {ex!r}")
