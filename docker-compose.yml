@@ -32,7 +32,7 @@ services:
       - TZ=Asia/Seoul
       - _JAVA_OPTIONS=-Xmx512m
     ports:
-      - "2333:2333"
+      - "23333:2333"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - --header='Authorization: ${LAVALINK_PASSWORD}' http://localhost:2333/version || exit 1"]
       interval: 10s
