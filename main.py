@@ -144,6 +144,8 @@ class DiscordBot(commands.Bot):
                     identifier=identifier,
                     uri=f"http://{host}:{port}",
                     password=password,
+                    # 봇 재시작 시 새 세션을 만들고 대기열도 초기화하므로 이전 세션 유지 안 함 (끊기면 lavalink가 플레이어 즉시 정리)
+                    resume_timeout=0,
                 )
             )
         return nodes
