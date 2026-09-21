@@ -716,11 +716,11 @@ class Music(commands.Cog):
                 try:
                     if message.content.startswith("https://www.youtube.com/watch?v=") or message.content.startswith("https://youtu.be/"):
                         if "&list=" in message.content:
-                            search_result = video_search_url(message.content.split('&list=', 1)[0])[0]
+                            search_result = (await asyncio.to_thread(video_search_url, message.content.split('&list=', 1)[0]))[0]
                         else:
-                            search_result = video_search_url(message.content)[0]
+                            search_result = (await asyncio.to_thread(video_search_url, message.content))[0]
                     else:
-                        search_result = video_search(message.content)[0]
+                        search_result = (await asyncio.to_thread(video_search, message.content))[0]
                 except Exception as ex:
                     msg = await message.channel.send("검색 중 오류가 발생했습니다.")
                     asyncio.create_task(delete_message_later(msg, 3))
