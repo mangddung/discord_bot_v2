@@ -2,7 +2,7 @@
 
 다양한 유틸리티 및 음악 기능을 제공하는 Discord 봇입니다. 이전에 공개한 코드들을 개선, 수정하여 모듈화 시켰습니다.
 
-음악 재생, 취침 모드 제어, 경기 팀 매칭, 추첨 기능 등을 통해 서버 관리와 즐거운 상호작용을 돕습니다.
+음악 재생, 취침 모드 제어, 경기 팀 매칭, 추첨, 환율 조회, 게임 서버 모니터링 기능 등을 통해 서버 관리와 즐거운 상호작용을 돕습니다.
 
 (GPT로 작성된 README 파일입니다.)
 
@@ -10,36 +10,60 @@
 
 ## 📦 주요 기능
 
-### steam.py - Compare Country Price
-- Detects Steam store page links in messages  
-- Deletes the original message  
-- Sends an embed with game info and price comparison  
-- Compares prices between two regions defined in `config.json`  
-- Includes discount info and currency conversion  
-- Requires valid region settings in `config.json`
-
 ### [🎵 music.py - 음악 재생 봇](https://github.com/mangddung/music-bot)
-- 유튜브 링크 또는 검색어 기반으로 음악을 재생합니다.
+- 유튜브 링크 또는 검색어 기반으로 음악을 재생합니다. (전용 채널에 채팅으로 곡 신청)
 - 음악 대기열 관리 및 자동 재생을 지원합니다.
 - 전용 텍스트 채널 생성 및 패널 UI 제공.
-- 스포티파이 연동 재생 (디스코드 스포티파이 활동을 기준으로 재생합니다. 스포티파이 연동이 필요합니다.)
-- `FFmpeg`와 `yt-dlp` 기반으로 고음질 스트리밍.
+- 스포티파이 연동 재생: 디스코드 스포티파이 활동(presence)이 바뀔 때마다 같은 곡을 찾아 재생합니다. 다른 사용자를 지정해 연동할 수도 있습니다. (Spotify API 키 필요)
+- 재생 엔진은 [Lavalink](https://github.com/lavalink-devs/Lavalink) + `wavelink`를 사용합니다. 다중 노드를 지원합니다.
+- YouTube 재생 안정화를 위해 `yt-cipher`(서명 복호화), `pot-provider`(poToken 발급) 사이드카를 함께 사용합니다.
+- 통화방에 봇만 남으면 `AUTO_DISCONNECT_TIMEOUT`(초) 후 자동 퇴장하며 대기열·패널을 정리합니다.
 
-#### 슬래쉬 명령어 명령어
-| 명령어       | 설명                                      |
-|--------------|-------------------------------------------|
-| `전용채널`  | 음악봇 명령을 받을 전용 채널을 생성합니다. |
-| `패널재생성`| 전용 패널 메시지를 재생성합니다.          |
-| `스포티파이`| 스포티파이 연동 재생을 시작합니다. |
+#### 슬래시 명령어
+| 명령어        | 설명                                                        |
+|---------------|-------------------------------------------------------------|
+| `/전용채널`   | 음악봇 명령을 받을 전용 채널을 생성합니다.                  |
+| `/패널재생성` | 전용 패널 메시지를 재생성합니다.                            |
+| `/스포티파이 [member]` | 스포티파이 연동 재생을 시작합니다. `member` 생략 시 본인 기준. |
+
+---
+
+### 🛒 steam.py - 스팀 지역별 가격 비교
+- 메시지에서 스팀 상점 링크를 감지해 원본 메시지를 지우고 게임 정보·가격 비교 임베드를 보냅니다.
+- 두 지역 가격, 할인 정보, 환율 환산을 함께 표시합니다. (Steam DB 링크 포함)
+- 기본 지역은 `config.json`의 `steam` 항목, 서버/개인별로 지역을 따로 지정할 수 있습니다.
+
+#### 슬래시 명령어
+| 명령어              | 설명                                      |
+|---------------------|-------------------------------------------|
+| `/스팀설정 서버`    | 서버의 비교 지역 설정 (관리자 전용)       |
+| `/스팀설정 개인`    | 개인 비교 지역 설정                       |
+| `/스팀설정 확인`    | 현재 적용될 지역 조합 확인                |
+| `/스팀설정 초기화`  | 개인/서버 지역 설정 초기화                |
+
+---
+
+### 💱 exchange.py - 환율 조회
+- [open.er-api.com](https://open.er-api.com) 환율 데이터를 주기적으로 받아 캐시합니다. (`utils/exchange_rate.py`, 스팀 모듈과 공유)
+
+| 명령어                    | 설명                                                      |
+|---------------------------|-----------------------------------------------------------|
+| `/환율 [base] [target]`   | 환율 조회/환산. 예) `/환율`, `/환율 jpy`, `/환율 1000usd krw` |
+| `/환율목록`               | 사용 가능한 통화 코드 목록                                |
 
 ---
 
 ### [💤 sleep_mode.py - 취침 모드](https://github.com/mangddung/discord-bot)
 - 유저가 설정한 시간 동안 보이스 채널 접속을 제한합니다.
-- 평일/휴일 설정 지원 및 자동 퇴장/알림 기능 제공.
+- 평일/휴일 설정 지원 및 자동 퇴장/알림 기능 제공. (알림 간격은 `config.json`의 `sleep_mode.notice_intervals`)
 - 데이터는 SQLite 및 SQLAlchemy ORM으로 저장됩니다.
 
-> 슬래시 명령어 기반 설정 사용 (`/취침모드 설정` 등)
+| 명령어           | 설명                         |
+|------------------|------------------------------|
+| `/취침모드 설정` | 취침 모드 시간 설정          |
+| `/취침모드 켜기` | 취침 모드 활성화             |
+| `/취침모드 끄기` | 취침 모드 비활성화           |
+| `/취침모드 확인` | 현재 설정 확인               |
 
 ---
 
@@ -48,73 +72,107 @@
 - 참가자들을 보이스 채널별로 분산 또는 통합 이동 가능.
 - 동일 명령자 기반으로 복수 경기 지원.
 
-> 슬래시 명령어 기반 기능
+> `/경기 생성`, `/경기 참가`, `/경기 전체참가`, `/경기 제외`, `/경기 랜덤팀`, `/경기 팀분배`, `/경기 팀확인`, `/경기 팀이동`, `/경기 종료`
 
 ---
 
-### [🔍 find_common_match.py - 롤 공통 매치 찾기](https://github.com/mangddung/find_riot_common_match)
+### [🔍 riot_common_match.py - 롤 공통 매치 찾기](https://github.com/mangddung/find_riot_common_match)
 - Riot API 기반으로 두 플레이어의 최근 경기 중 공통 매치를 찾습니다.
-- 최대 300경기까지 검색 가능하며, 결과는 링크로 출력됩니다.
+- 검색 범위는 `config.json`의 `riot_match.max_index`(기본 400경기), 결과는 링크로 출력됩니다.
 
-> 슬래시 명령어 기반 기능
+> `/롤`
 
 ---
 
 ### 🎲 funny.py - 랜덤 추첨 유틸
-- 숫자 범위 내 난수 추첨 기능
-- 문자열 리스트 중 하나 랜덤 선택
-- 보이스 채널 참가자 중 랜덤 유저 선택
-
-> 슬래시 명령어 기반 기능
+| 명령어      | 설명                                             |
+|-------------|--------------------------------------------------|
+| `/난수뽑기` | a~b 범위에서 n개의 난수를 뽑습니다.              |
+| `/추첨1`    | 목록 중에서 랜덤으로 1개를 뽑습니다.             |
+| `/추첨2`    | 참가 중인 보이스 채널 멤버 중 랜덤으로 1명을 뽑습니다. |
 
 ---
 
-### 🎮 mc_server.py - Minecraft Server Monitor
-- Real-time monitoring of Minecraft server status
-- Automatic updates every 5 minutes with live player count and server info
-- Shared server data across multiple guilds to prevent duplicate queries
-- Domain-to-IP resolution for server address validation
-- Dedicated read-only channels with embedded status panels
-- Abuse prevention with rate limiting and guild-based registration caps
+### 🔐 channel_access.py - 채널 접근 권한 부여
+- 비공개 텍스트 채널을 만들고, 메시지에 ✅ 반응을 누르면 해당 채널 접근 권한을 부여합니다. (반응 취소 시 회수) (관리자 전용)
 
-#### Slash Commands
-| Command       | Description                                      |
-|--------------|--------------------------------------------------|
-| `/mcs_add`   | Creates a monitoring channel with server details |
-| `/mcs_remove`| Removes a server monitoring channel              |
-| `/mcs_list`  | Shows all registered servers in the guild        |
-| `/mcs_update`| Manually updates server status panels            |
+> `/채널접근 채널생성`, `/채널접근 메시지생성`, `/채널접근 메시지삭제`
 
-#### Features
-- **Efficient Querying**: Servers are queried only once every 30 seconds, even if monitored by multiple guilds
-- **Auto-cleanup**: Automatically removes database entries when channels are deleted
-- **Security**: Rate limiting (3 registrations per minute) and registration caps (10 servers per guild)
-- **Smart Caching**: Stores both domain names and resolved IPs for reliability
+---
+
+### 🎮 game_server.py - 게임 서버 모니터링
+- Minecraft, Palworld 서버 상태를 실시간으로 모니터링합니다. (핸들러는 `cogs/servers/`)
+- 서버마다 읽기 전용 전용 채널과 상태 패널 임베드를 생성합니다.
+- 여러 길드가 같은 서버를 등록해도 조회는 30초에 한 번만 수행합니다.
+- 도메인→IP 변환으로 주소를 검증하고, 채널 삭제 시 DB 항목을 자동 정리합니다.
+- 남용 방지: 길드당 1분에 3개까지 등록 가능.
+
+| 명령어           | 설명                          |
+|------------------|-------------------------------|
+| `/server_add`    | 서버 종류 선택 후 모니터링 채널 생성 |
+| `/server_remove` | 모니터링 채널 제거            |
+| `/server_list`   | 등록된 서버 목록              |
+| `/server_update` | 서버 패널 즉시 갱신           |
 
 ---
 
 ## 🛠 설치 방법
 
-### 방법 1: 로컬 환경
+### 설정 파일
+- `.env_example` → `.env` 복사 후 값 입력
+  - `DISCORD_TOKEN`, `RIOT_API`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_SECRET_KEY`
+  - `LAVALINK_PASSWORD`, `LAVALINK_NODES` (JSON 배열, 노드 추가 방법은 `.env_example` 주석 참고)
+  - `AUTO_DISCONNECT_TIMEOUT` (봇 혼자 남았을 때 퇴장까지 대기 초)
+- `config_example.json` → `config.json` 복사 후 봇 환경 설정
+
+### 방법 1: Docker (권장)
 1. 이 저장소를 클론합니다.
-2. Python 환경에서 다음 명령어를 실행하여 패키지를 설치하세요:
+2. Docker를 설치해주세요.
+3. 위 설정 파일을 준비합니다.
+4. Lavalink youtube 플러그인은 첫 실행 시 `lavalink/application.yml` 설정대로 `lavalink/plugins`에 자동 다운로드됩니다.
+5. 다음 명령어로 빌드·실행합니다. (`discord-bot`, `lavalink`, `yt-cipher`, `pot-provider` 컨테이너가 함께 뜹니다)
+```
+docker compose up --build -d
+```
+- Lavalink 호스트 포트는 `23333`입니다. (Windows에서 2333이 예약 포트 대역에 걸리는 문제 회피)
+
+### 방법 2: 로컬 환경
+1. 이 저장소를 클론합니다.
+2. Python 환경에서 패키지를 설치합니다.
 ```
 pip install -r requirements.txt
 ```
-3. music 기능을 사용할려면 FFmpeg를 운영체제에 맞게 설치해주세요.
-4. .env에 API키 및 FFmpeg 경로를, config.json에는 봇 환경을 설정합니다.
-5. main.py를 실행하세요.
+3. 음악 기능을 쓰려면 Lavalink 서버(및 yt-cipher, pot-provider)를 별도로 실행하고 `.env`의 `LAVALINK_NODES`를 해당 주소로 맞춰주세요.
+4. `main.py`를 실행하세요.
 
-### 방법 2: Docker
-1. 이 저장소를 클론합니다.
-2. Docker를 설치해주세요.
-3. .env에 API키를, config.json에는 봇 환경을 설정합니다.
-4. 다음 명령어로 Docker 컨테이너를 빌드하고 실행합니다.
-```
- docker-compose up --build -d
-```
+---
 
 # 업데이트 기록
+- 2026-09-21
+ 1. 스포티파이 연동 동기화를 5초 폴링에서 presence 이벤트 기반으로 전환
+ 2. 채팅 곡 신청 시 유튜브 검색이 이벤트 루프를 막는 문제 수정
+ 3. 봇 재시작 시 Lavalink 이전 세션 플레이어가 계속 재생되는 문제 수정
+ 4. 통화방에 봇만 남아 나갈 때 대기열·패널 정리 안 되는 문제 수정
+ 5. Lavalink 호스트 포트 23333으로 변경
+- 2026-09-19
+ 1. `/환율`, `/환율목록` 명령어 추가 (환율 코드를 `utils/exchange_rate.py` 공통 모듈로 분리)
+- 2026-09-15
+ 1. YouTube 재생 안정화: yt-cipher, pot-provider 사이드카 추가 및 poToken 자동 갱신
+ 2. Lavalink/youtube 플러그인 버전 고정, Lavalink 재시작 후 재연결 대응
+ 3. 스포티파이 연동 시 시작 위치 지정 재생 403 우회, 같은 곡 연속 로드 실패 시 재시도 중단
+- 2026-07-29
+ 1. `/스포티파이`에 `member` 인자 추가, 스포티파이 활동 캐시 도입
+- 2026-06-26
+ 1. 음악 재생 엔진을 FFmpeg/yt-dlp 스트리밍에서 Lavalink/wavelink로 마이그레이션
+- 2026-06-25
+ 1. 스팀: 환율 소스 변경, 서버/개인별 지역 설정(`/스팀설정`) 추가
+ 2. 취침 모드: 버그 수정, `/취침모드 확인` 추가, Rate limit 대응
+- 2026-06-01
+ 1. 채널 접근 권한 부여 기능(`channel_access`) 추가
+ 2. 게임 서버 모니터링 리팩토링(`mc_server` → `game_server`), Palworld 지원 추가
+ 3. 스포티파이 연동 재생 관리자 권한 제한 제거
+- 2025-12-13
+ 1. Minecraft 서버 모니터링 기능 추가
 - 2025-07-20
  1. 스포티파이 연동 재생 기능 추가 (디스코드내 스포티파이 활동 기준)
  2. 슬래시 커맨드 도입
